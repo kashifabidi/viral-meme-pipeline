@@ -1,0 +1,114 @@
+name: Viral Meme Pipeline
+
+on:
+  schedule:
+    - cron: '0 10,18 * * *'
+  workflow_dispatch:  # manual run from the Actions tab
+
+env:
+  # GitHub-hosted runners mount the job at C:\acted (the repo root).
+  VIRAL_PIPELINE_DIR: C:\acted
+  GOOGLE_DRIVE_FOLDER_ID: ''
+  GOOGLE_OAUTH_CLIENT_ID: ''
+  GOOGLE_OAUTH_CLIENT_SECRET: ''
+  GOOGLE_OAUTH_TOKEN: ''
+
+jobs:
+  produce-memes:
+    name: Produce memes (daily batch)
+    runs-on: windows-latest
+    timeout-minutes: 150
+    concurrency:
+      group: viral-meme-pipeline
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install FFmpeg
+        run: |
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+            winget install --id Gyan.FFmpeg -e --accept-source-agreements --accept-package-agreements --silent
+            $env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User')
+          }
+          ffmpeg -version | Select-Object -First 1
+      - name: Install dependencies
+        run: |
+          & .venv\Scripts\python.exe -m pip install --upgrade pip setuptools wheel
+          & .venv\Scripts\python.exe -m pip install -r requirements.txt
+
+      - name: Write credentials from GitHub Secrets
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $envOut = @()
+          if ($env:GOOGLE_DRIVE_FOLDER_ID) { $envOut += "GOOGLE_DRIVE_FOLDER_ID=$env:GOOGLE_DRIVE_FOLDER_ID" }
+          if ($env:GOOGLE_OAUTH_CLIENT_ID)  { $envOut += "GOOGLE_OAUTH_CLIENT_ID=$env:GOOGLE_OAUTH_CLIENT_ID" }
+          if ($env:GOOGLE_OAUTH_CLIENT_SECRET) { $envOut += "GOOGLE_OAUTH_CLIENT_SECRET=$env:GOOGLE_OAUTH_CLIENT_SECRET" }
+          if ($envOut) { Set-Content -Path .env -Value $envOut -Encoding UTF8 }
+          if ($env:GOOGLE_OAUTH_TOKEN) {
+            $decoded = [Convert]::FromBase64String($env:GOOGLE_OAUTH_TOKEN)
+            [IO.File]::WriteAllText('google_oauth_token.json', $decoded, [Text.Encoding]::UTF8)
+          }
+          Get-Content .env
+        shell: pwsh
+
+      - name: Verify tools
+        run: |
+          ffmpeg -version | Select-Object -First 1
+          .venv\Scripts\python.exe -c "import yt_dlp, moviepy, librosa, requests; print('core ok')"
+          .venv\Scripts\python.exe -c "from google.oauth2.credentials import Credentials; print('oauth ok')"
+
+      - name: Harvest + edit + upload
+        id: pipeline
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $log = Join-Path $env:VIRAL_PIPELINE_DIR 'actions.log'
+          $start = Get-Date
+          try {
+            & .venv\Scripts\python.exe main.py --harvest --max 3 --keep-local | Tee-Object -FilePath $log
+          } catch {
+            Write-Warning "Pipeline raised: $_"
+          }
+          $end = Get-Date
+          $ms = ([DateTime]::UtcNow - $start).TotalSeconds
+          Write-Host "PIPELINE_DURATION_SECONDS=$ms"
+        shell: pwsh
+
+      - name: Collect renders
+        if: always()
+        run: |
+          if (Test-Path output) {
+            $items = Get-ChildItem output -Filter '*.mp4' -ErrorAction SilentlyContinue
+            if ($items) {
+              $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+              $zip = "memes_$stamp.zip"
+              Compress-Archive -Path output\*.mp4 -DestinationPath $zip
+              Write-Host "PIPELINE_RENDER_COUNT=$($items.Count)"
+              Rename-Item -Path $zip -NewName "memes_$stamp.zip"
+            }
+          }
+        shell: pwsh
+
+      - name: Upload renders to Actions artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meme-renders
+          path: memes_*.zip
+          if-no-files-found: ignore
+
+      - name: Summary
+        if: always()
+        run: |
+          $log = Get-Content actions.log -ErrorAction SilentlyContinue
+          if (Select-String -Quiet -Pattern 'PIPELINE DONE' actions.log) { echo '✅ Batch complete' }
+          else { echo '❌ Batch failed — see actions.log' }
+          $log | Select-Object -Last 12
+        shell: pwsh
+

@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+downloads/*
+!downloads/.gitkeep
+output/*
+!output/.gitkeep
+pip_install*.log
+whisper*.log
+.env
+service_account.json
+
+# OAuth refresh token (never commit)
+google_oauth_token.json
+
+# Scheduled-run logs (written by run_scheduled.bat)
+bot.log
+bot.log.old

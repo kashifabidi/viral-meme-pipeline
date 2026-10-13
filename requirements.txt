@@ -1,0 +1,15 @@
+yt-dlp
+moviepy==1.0.3
+librosa
+numpy
+requests
+openai-whisper
+pillow
+google-api-python-client
+google-auth
+google-auth-httplib2
+google-auth-oauthlib
+python-dotenv
+# Whisper dependency. GitHub-hosted runners do not ship torch, so CI cannot
+# transcribe captions on the first run without it (downloads ~2 GB).
+torch>=2.2.0
