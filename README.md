@@ -165,4 +165,28 @@ video/audio stream merging works. If you see merge errors, verify with:
 
 ```powershell
 .\.venv\Scripts\python.exe -c "from viral_harvester import _ffmpeg_location as f; print(f()[1])"
+
+
+## GitHub Actions scheduler (code already committed)
+
+A workflow is checked into `.github/workflows/viral-meme-pipeline.yml`. It runs on the same daily schedule as the Windows Task Scheduler tasks and needs only GitHub Secrets — no local machine required.
+
+## GitHub Actions secrets (one-time setup)
+
+On the repo **Settings → Secrets and variables → Actions**, add these four secrets:
+
+| Secret | Value | Notes |
+|---|---|---|
+| `GOOGLE_DRIVE_FOLDER_ID` | `1-z91SWD6NnhG9KlRN_laTrw60dXQHyxe` | 5 TB folder ID |
+| `GOOGLE_OAUTH_CLIENT_ID` | `163592659861-...` | OAuth client ID (Cloud Console → Desktop app) |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | `GOCSPX-....` | OAuth client secret |
+| `GOOGLE_OAUTH_TOKEN` | base64 of `google_oauth_token.json` | You can create it on any machine with: `Get-Content google_oauth_token.json -Encoding Byte \| ConvertTo-Base64` |
+
+The workflow decodes `GOOGLE_OAUTH_TOKEN` back into `google_oauth_token.json`, so the runner refreshes itself with zero browser involvement.
+
+> Cron runs in UTC — adjust the schedule in `.github/workflows/viral-meme-pipeline.yml` for your local timezone.
+
+## Overflow provisioning (your 5 TB Drive)
+
+You mentioned your Drive has plenty of storage. The current workflow uses your own Google One quota via OAuth (the default), so renders are written to `GOOGLE_DRIVE_FOLDER_ID`. If you ever want the service account to write into a shared drive instead, that requires a Workspace shared drive — outside these credentials. The current setup is fully working and self-refreshing.
 ```
