@@ -16,3 +16,9 @@ google_oauth_token.json
 # Scheduled-run logs (written by run_scheduled.bat)
 bot.log
 bot.log.old
+# Local dev scratch
+_push.py
+_push.err.txt
+_push.out.txt
+_push_old.py
+_gitcheck.py
