@@ -258,11 +258,11 @@ def stage_render(video_path, climax, caption) -> str:
         raise SystemExit(5)
 
 
-def stage_upload(mp4_path: str):
+def stage_upload(mp4_path: str, keep_local: bool = False):
     from drive_uploader import upload_video_to_drive
 
     try:
-        fid, link = upload_video_to_drive(mp4_path)
+        fid, link = upload_video_to_drive(mp4_path, keep_local=keep_local)
         if fid:
             log.info("Drive upload OK: id=%s link=%s", fid, link)
         else:

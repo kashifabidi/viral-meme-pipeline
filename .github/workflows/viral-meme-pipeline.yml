@@ -6,12 +6,10 @@ on:
   workflow_dispatch:  # manual run from the Actions tab
 
 env:
-  # GitHub-hosted runners mount the job at C:\acted (the repo root).
-  VIRAL_PIPELINE_DIR: C:\acted
-  GOOGLE_DRIVE_FOLDER_ID: ''
-  GOOGLE_OAUTH_CLIENT_ID: ''
-  GOOGLE_OAUTH_CLIENT_SECRET: ''
-  GOOGLE_OAUTH_TOKEN: ''
+  GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+  GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+  GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+  GOOGLE_OAUTH_TOKEN: ${{ secrets.GOOGLE_OAUTH_TOKEN }}
 
 jobs:
   produce-memes:
@@ -38,10 +36,13 @@ jobs:
             $env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User')
           }
           ffmpeg -version | Select-Object -First 1
+
       - name: Install dependencies
         run: |
-          & .venv\Scripts\python.exe -m pip install --upgrade pip setuptools wheel
-          & .venv\Scripts\python.exe -m pip install -r requirements.txt
+          python -m pip install --upgrade pip setuptools wheel
+          # Install CPU torch first so it does not pull the 2.5GB CUDA binary
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt
 
       - name: Write credentials from GitHub Secrets
         run: |
@@ -50,28 +51,32 @@ jobs:
           if ($env:GOOGLE_DRIVE_FOLDER_ID) { $envOut += "GOOGLE_DRIVE_FOLDER_ID=$env:GOOGLE_DRIVE_FOLDER_ID" }
           if ($env:GOOGLE_OAUTH_CLIENT_ID)  { $envOut += "GOOGLE_OAUTH_CLIENT_ID=$env:GOOGLE_OAUTH_CLIENT_ID" }
           if ($env:GOOGLE_OAUTH_CLIENT_SECRET) { $envOut += "GOOGLE_OAUTH_CLIENT_SECRET=$env:GOOGLE_OAUTH_CLIENT_SECRET" }
-          if ($envOut) { Set-Content -Path .env -Value $envOut -Encoding UTF8 }
+          if ($envOut.Count -gt 0) { Set-Content -Path .env -Value $envOut -Encoding UTF8 }
           if ($env:GOOGLE_OAUTH_TOKEN) {
             $decoded = [Convert]::FromBase64String($env:GOOGLE_OAUTH_TOKEN)
-            [IO.File]::WriteAllText('google_oauth_token.json', $decoded, [Text.Encoding]::UTF8)
+            [IO.File]::WriteAllBytes('google_oauth_token.json', $decoded)
           }
-          Get-Content .env
+          if (Test-Path .env) {
+            Get-Content .env
+          } else {
+            Write-Host "No Google credentials provided; running in local/artifact mode."
+          }
         shell: pwsh
 
       - name: Verify tools
         run: |
           ffmpeg -version | Select-Object -First 1
-          .venv\Scripts\python.exe -c "import yt_dlp, moviepy, librosa, requests; print('core ok')"
-          .venv\Scripts\python.exe -c "from google.oauth2.credentials import Credentials; print('oauth ok')"
+          python -c "import yt_dlp, moviepy, requests; print('core ok')"
+          python -c "from google.oauth2.credentials import Credentials; print('oauth ok')"
 
       - name: Harvest + edit + upload
         id: pipeline
         run: |
           $ErrorActionPreference = 'Continue'
-          $log = Join-Path $env:VIRAL_PIPELINE_DIR 'actions.log'
+          $log = 'actions.log'
           $start = Get-Date
           try {
-            & .venv\Scripts\python.exe main.py --harvest --max 3 --keep-local | Tee-Object -FilePath $log
+            python main.py --harvest --max 3 --keep-local | Tee-Object -FilePath $log
           } catch {
             Write-Warning "Pipeline raised: $_"
           }
@@ -90,7 +95,6 @@ jobs:
               $zip = "memes_$stamp.zip"
               Compress-Archive -Path output\*.mp4 -DestinationPath $zip
               Write-Host "PIPELINE_RENDER_COUNT=$($items.Count)"
-              Rename-Item -Path $zip -NewName "memes_$stamp.zip"
             }
           }
         shell: pwsh
@@ -106,9 +110,15 @@ jobs:
       - name: Summary
         if: always()
         run: |
-          $log = Get-Content actions.log -ErrorAction SilentlyContinue
-          if (Select-String -Quiet -Pattern 'PIPELINE DONE' actions.log) { echo '✅ Batch complete' }
-          else { echo '❌ Batch failed — see actions.log' }
-          $log | Select-Object -Last 12
+          if (Test-Path actions.log) {
+            $log = Get-Content actions.log
+            if ($log -match 'PIPELINE DONE') {
+              Write-Host '✅ Batch complete'
+            } else {
+              Write-Host '❌ Batch failed — see actions.log'
+            }
+            $log | Select-Object -Last 15
+          } else {
+            Write-Host '⚠️ actions.log not found'
+          }
         shell: pwsh
-

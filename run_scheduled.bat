@@ -5,15 +5,13 @@ REM  Launched by Windows Task Scheduler ("MemeBot-Harvest").
 REM  Runs the full pipeline: harvest -> edit -> upload -> cleanup.
 REM ============================================================
 setlocal
-cd /d "C:\Projects\viral-pipeline"
+cd /d "%~dp0"
 
 set "LOG=bot.log"
-set "PYTHON=.venv\Scripts\python.exe"
-
-REM --- Sanity checks: fail loudly into the log, not silently ---
-if not exist "%PYTHON%" (
-    echo [%date% %time%] FATAL: venv python missing at %PYTHON% >> "%LOG%"
-    exit /b 1
+if exist "%~dp0.venv\Scripts\python.exe" (
+    set "PYTHON=%~dp0.venv\Scripts\python.exe"
+) else (
+    set "PYTHON=python.exe"
 )
 
 REM --- Rotate the log past ~5 MB so it can never fill the disk ---

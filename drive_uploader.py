@@ -229,7 +229,7 @@ def check_destination(service=None, folder_id: str = None,
     return info
 
 
-def upload_video_to_drive(file_path: str, custom_name: str = None):
+def upload_video_to_drive(file_path: str, custom_name: str = None, keep_local: bool = False):
     """Upload MP4 to the Drive folder, delete local copy, return id+link.
 
     Returns:
@@ -286,11 +286,14 @@ def upload_video_to_drive(file_path: str, custom_name: str = None):
                 except Exception:
                     pass
 
-    try:
-        os.remove(file_path)
-        print(f"[drive] deleted local copy: {file_path}")
-    except OSError as exc:
-        print(f"[drive] uploaded but local delete failed: {exc}")
+    if not keep_local:
+        try:
+            os.remove(file_path)
+            print(f"[drive] deleted local copy: {file_path}")
+        except OSError as exc:
+            print(f"[drive] uploaded but local delete failed: {exc}")
+    else:
+        print(f"[drive] kept local copy (--keep-local): {file_path}")
     return file_id, link
 
 
