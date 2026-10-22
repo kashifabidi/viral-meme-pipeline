@@ -12,21 +12,62 @@ import os
 import shutil
 import subprocess
 
-import numpy as np
-from moviepy.editor import (
-    AudioFileClip,
-    CompositeAudioClip,
-    CompositeVideoClip,
-    ImageClip,
-    VideoFileClip,
-    concatenate_videoclips,
-)
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 # Compat: moviepy 1.0.3 references PIL.Image.ANTIALIAS, removed in Pillow 10+.
 # Alias it to LANCZOS so resize() works with modern Pillow.
 if not hasattr(Image, "ANTIALIAS"):
     Image.ANTIALIAS = Image.LANCZOS  # type: ignore[attr-defined]
+
+
+def _resolve_ffmpeg() -> str:
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if os.path.isfile(exe):
+            d = os.path.dirname(exe)
+            std = os.path.join(d, "ffmpeg.exe")
+            if os.path.isfile(std):
+                return std
+            return exe
+    except Exception:
+        pass
+    base = os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                        "Microsoft", "WinGet", "Packages")
+    try:
+        for entry in os.listdir(base):
+            if "Gyan.FFmpeg" in entry:
+                cand = os.path.join(base, entry)
+                for root, _d, files in os.walk(cand):
+                    if "ffmpeg.exe" in files:
+                        return os.path.join(root, "ffmpeg.exe")
+    except OSError:
+        pass
+    return "ffmpeg"
+
+
+_resolved_ffmpeg = _resolve_ffmpeg()
+if os.path.isfile(_resolved_ffmpeg):
+    _ffmpeg_dir = os.path.dirname(_resolved_ffmpeg)
+    if _ffmpeg_dir not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = _ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+os.environ["IMAGEIO_FFMPEG_EXE"] = _resolved_ffmpeg
+os.environ["FFMPEG_BINARY"] = _resolved_ffmpeg
+
+import numpy as np
+from moviepy.editor import (
+    AudioFileClip,
+    ColorClip,
+    VideoClip,
+    CompositeAudioClip,
+    CompositeVideoClip,
+    ImageClip,
+    VideoFileClip,
+    concatenate_videoclips,
+)
 
 TARGET_W, TARGET_H = 1080, 1920  # 9:16 vertical
 
@@ -179,6 +220,74 @@ def create_meme_text_image(
     return img
 
 
+HOOK_TEMPLATES = [
+    "WAIT FOR IT... ??",
+    "BRO REALLY THOUGHT ??",
+    "HE REGRETTED THIS IMMEDIATELY ??",
+    "NO WAY THIS JUST HAPPENED ??",
+    "NEVER LET THEM KNOW YOUR NEXT MOVE ??",
+    "TOP 10 MOMENTS BEFORE DISASTER ??",
+    "TASK FAILED SUCCESSFULLY ??",
+    "WATCH TILL THE END ??",
+    "INSTANT REGRET ??",
+    "CALCULATED RISK ??",
+    "IT KEEPS GETTING WORSE ??",
+    "WHO DID THIS ????",
+    "PHYSICS HAS LEFT THE CHAT ??",
+]
+
+
+def create_hook_banner_image(
+    text: str,
+    base_fontsize: int = 40,
+    max_width: int = 960,
+    scale: float = 1.0,
+) -> Image.Image:
+    """Render an eye-catching viral hook banner (e.g. 'WAIT FOR IT... ??')."""
+    text = (text or "").strip()
+    fontsize = max(20, int(round(base_fontsize * scale)))
+    font = None
+    for candidate in ("impact.ttf", "arialbd.ttf", "DejaVuSans-Bold.ttf", "arial.ttf"):
+        try:
+            font = ImageFont.truetype(candidate, fontsize)
+            break
+        except OSError:
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+
+    probe = Image.new("RGBA", (10, 10))
+    drawer = ImageDraw.Draw(probe)
+    stroke_w = max(1, int(round(2 * scale)))
+    bbox = drawer.textbbox((0, 0), text, font=font, stroke_width=stroke_w)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+
+    pad_x = max(16, int(round(26 * scale)))
+    pad_y = max(8, int(round(12 * scale)))
+    w = min(int(round(max_width * scale)), text_w + pad_x * 2)
+    h = text_h + pad_y * 2
+
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    radius = max(6, int(round(12 * scale)))
+    border_w = max(1, int(round(2 * scale)))
+    draw.rounded_rectangle(
+        [0, 0, w - 1, h - 1],
+        radius=radius,
+        fill=(15, 15, 15, 215),
+        outline=(255, 235, 0, 200),
+        width=border_w,
+    )
+    tx = (w - text_w) // 2
+    ty = (h - text_h) // 2 - bbox[1] // 2
+    draw.text(
+        (tx, ty), text, font=font, fill=(255, 255, 255, 255),
+        stroke_width=stroke_w, stroke_fill=(0, 0, 0, 255)
+    )
+    return img
+
+
 def create_credit_badge_image(
     credit_text: str,
     base_fontsize: int = 30,
@@ -263,6 +372,7 @@ def assemble_meme_edit_with_freeze_and_caption(
     freeze_duration: float = 1.0,
     pre_roll: float = 6.0,
     credit_text: str = None,
+    hook_text: str = None,
 ) -> str:
     """Assemble the full meme edit and export to output_path.
 
@@ -350,9 +460,11 @@ def assemble_meme_edit_with_freeze_and_caption(
     else:
         seg2 = seg2.without_audio()
 
-    # Segment 3: resume with impact SFX + overlay cutout.
+    # Segment 3: resume with impact SFX + overlay cutout (capped to 3.5s punchline).
+    post_roll = 3.5
     if climax < total - 0.05:
-        tail_raw = src.subclip(climax)
+        tail_end = min(total, climax + post_roll)
+        tail_raw = src.subclip(climax, tail_end)
     else:
         tail_raw = src.subclip(max(0.0, total - 0.5))
     seg3_base = build_9_16_base(tail_raw, _tw, _th)
@@ -388,23 +500,45 @@ def assemble_meme_edit_with_freeze_and_caption(
     final = concatenate_videoclips([seg1, seg2, seg3], method="compose")
     final.fps = int(fps)
 
-    # Optional attribution watermark (credit pill badge)
+    import random
+
+    extra_layers = [final]
+
+    # 1. Attribution watermark (credit pill badge)
     if credit_text and credit_text.strip():
         try:
             badge_img = create_credit_badge_image(credit_text.strip(), scale=_scale)
             badge_clip = (ImageClip(np.array(badge_img))
                           .set_duration(final.duration)
-                          .set_position(("center", 0.08), relative=True))
-            final = CompositeVideoClip([final, badge_clip], size=(_tw, _th))
-            final.fps = int(fps)
+                          .set_position(("center", 0.06), relative=True))
+            extra_layers.append(badge_clip)
         except Exception as exc:
             print(f"[editor] credit watermark failed ({exc}); continuing without badge")
+
+    # 2. Viral Hook Header Banner (Top retention hook)
+    if hook_text is None and HOOK_TEMPLATES:
+        hook_text = random.choice(HOOK_TEMPLATES)
+    if hook_text and hook_text.strip():
+        try:
+            hook_img = create_hook_banner_image(hook_text.strip(), scale=_scale)
+            hook_clip = (ImageClip(np.array(hook_img))
+                         .set_duration(final.duration)
+                         .set_position(("center", 0.13), relative=True))
+            extra_layers.append(hook_clip)
+        except Exception as exc:
+            print(f"[editor] hook banner failed ({exc}); skipping")
+
+# Progress bar removed for maximum MoviePy encoding speed.
+
+    if len(extra_layers) > 1:
+        final = CompositeVideoClip(extra_layers, size=(_tw, _th))
+        final.fps = int(fps)
 
     # Encode at edit res, then upscale to 1080x1920 in one cheap pass.
     edit_path = (os.path.splitext(output_path)[0] + "_edit.mp4"
                  if _scale != 1.0 else output_path)
     final.write_videofile(edit_path, codec="libx264", audio_codec="aac",
-                          fps=int(fps), preset="medium", threads=4,
+                          fps=int(fps), preset="veryfast", threads=4,
                           logger=None)
     if edit_path != output_path:
         # Output dims are even, so no odd-height chroma padding needed.

@@ -13,6 +13,11 @@ import random
 import subprocess
 import sys
 import time
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -240,39 +245,46 @@ def stage_caption(video_path: str, climax: float) -> str:
         raise SystemExit(4)
 
 
-def stage_render(video_path, climax, caption, credit=None) -> str:
+def stage_render(video_path, climax, caption, credit=None, hook_text=None) -> str:
     from video_editor import assemble_meme_edit_with_freeze_and_caption
 
     meta_path = os.path.splitext(video_path)[0] + ".meta.json"
-    if not credit and os.path.isfile(meta_path):
+    meta = {}
+    if os.path.isfile(meta_path):
         try:
             import json
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
-                credit = meta.get("credit")
         except Exception:
             pass
+
+    if not credit:
+        credit = meta.get("credit")
     if credit:
         log.info("Attribution: %s", credit)
 
-    # Two DISTINCT SFX: scratch on the freeze, boom on the resume.
-    scratch, boom = _pick_files(SFX_DIR, AUDIO_EXTS, count=2)
-    (overlay,) = _pick_files(OVERLAY_DIR, (".png", ".jpg", ".jpeg", ".webp"),
-                             count=1)
+    # Categorized SFX: suspense/pause sound on freeze, impact punch sound on resume crash
+    FREEZE_KEYWORDS = ("scratch", "freeze", "error", "wow", "bruh", "dun")
+    IMPACT_KEYWORDS = ("boom", "bonk", "pipe", "fart", "trombone", "dog")
+
+    all_sfx = _list_files(SFX_DIR, AUDIO_EXTS)
+    freeze_candidates = [f for f in all_sfx if any(k in os.path.basename(f).lower() for k in FREEZE_KEYWORDS)] or all_sfx
+    impact_candidates = [f for f in all_sfx if any(k in os.path.basename(f).lower() for k in IMPACT_KEYWORDS)] or all_sfx
+
+    scratch = random.choice(freeze_candidates) if freeze_candidates else None
+    remaining_impact = [f for f in impact_candidates if f != scratch] or impact_candidates
+    boom = random.choice(remaining_impact) if remaining_impact else None
+
+    # Pick 1 random overlay cutout out of all available meme emojis/graphics
+    (overlay,) = _pick_files(OVERLAY_DIR, (".png", ".jpg", ".jpeg", ".webp"), count=1)
     log.info("SFX scratch=%s boom=%s overlay=%s", scratch, boom, overlay)
-    if not scratch:
-        log.warning("No scratch SFX in %s/ (freeze will be silent).", SFX_DIR)
-    if not boom:
-        log.warning("No impact SFX in %s/ (resume keeps orig audio).", SFX_DIR)
-    if not overlay:
-        log.warning("No overlay in %s/ (skipping cutout).", OVERLAY_DIR)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out = os.path.abspath(os.path.join(OUTPUT_DIR, f"meme_{stamp}.mp4"))
     try:
         assemble_meme_edit_with_freeze_and_caption(
             video_path, climax, caption, scratch, boom, overlay, out,
-            credit_text=credit)
+            credit_text=credit, hook_text=hook_text)
         log.info("Rendered -> %s", out)
         return out
     except Exception as exc:

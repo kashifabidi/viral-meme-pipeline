@@ -14,15 +14,34 @@ import shutil
 import subprocess
 import tempfile
 
-import librosa  # RMS via librosa.feature.rms; numpy fallback if numba DLL missing
+try:
+    import librosa
+except ImportError:
+    librosa = None
 import numpy as np
 
 
 def _resolve_ffmpeg_bin(name: str) -> str:
-    """Resolve ffmpeg/ffprobe absolute path (WinGet shim may miss PATH)."""
+    """Resolve ffmpeg/ffprobe absolute path (WinGet shim or imageio-ffmpeg)."""
     found = shutil.which(name)
     if found:
         return found
+    # Fallback: imageio_ffmpeg binary
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if os.path.isfile(exe):
+            d = os.path.dirname(exe)
+            std = os.path.join(d, f"{name}.exe")
+            if os.path.isfile(std):
+                return std
+            scripts_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(d))), "Scripts")
+            script_exe = os.path.join(scripts_dir, f"{name}.exe")
+            if os.path.isfile(script_exe):
+                return script_exe
+            return exe
+    except Exception:
+        pass
     # Fallback: Gyan.FFmpeg WinGet package layout.
     base = os.path.join(os.environ.get("LOCALAPPDATA", ""),
                         "Microsoft", "WinGet", "Packages")
@@ -43,7 +62,7 @@ FFPROBE = _resolve_ffmpeg_bin("ffprobe")
 
 
 def _get_duration_seconds(video_path: str) -> float:
-    """Return media duration in seconds via ffprobe, 0.0 on failure."""
+    """Return media duration in seconds via ffprobe or ffmpeg, 0.0 on failure."""
     try:
         out = subprocess.run(
             [
@@ -57,13 +76,32 @@ def _get_duration_seconds(video_path: str) -> float:
             text=True,
             check=False,
         )
-        return float(out.stdout.strip())
-    except (ValueError, OSError, subprocess.SubprocessError):
-        return 0.0
+        val = float(out.stdout.strip())
+        if val > 0:
+            return val
+    except Exception:
+        pass
+
+    # Fallback via FFMPEG -i output
+    try:
+        out = subprocess.run(
+            [FFMPEG, "-i", video_path],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        import re
+        match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", out.stderr)
+        if match:
+            h, m, s = match.groups()
+            return int(h) * 3600 + int(m) * 60 + float(s)
+    except Exception:
+        pass
+    return 0.0
 
 
 def _has_audio_stream(video_path: str) -> bool:
-    """True if ffprobe finds at least one audio stream."""
+    """True if video has an audio stream (via ffprobe or ffmpeg)."""
     try:
         out = subprocess.run(
             [FFPROBE, "-v", "error", "-select_streams", "a",
@@ -71,8 +109,17 @@ def _has_audio_stream(video_path: str) -> bool:
              "-of", "csv=p=0", video_path],
             capture_output=True, text=True, check=False,
         )
-        return bool(out.stdout.strip())
-    except (OSError, subprocess.SubprocessError):
+        if out.stdout.strip():
+            return True
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            [FFMPEG, "-i", video_path],
+            capture_output=True, text=True, check=False,
+        )
+        return "Audio:" in out.stderr
+    except Exception:
         return False
 
 
@@ -151,9 +198,13 @@ def find_climax_timestamp(
             return 0.0
 
         hop_length = 512
-        try:
-            rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
-        except Exception:
+        rms = None
+        if librosa is not None:
+            try:
+                rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+            except Exception:
+                rms = None
+        if rms is None:
             # Fallback: pure-numpy RMS envelope (no numba/llvmlite needed).
             # Pads tail so framing matches librosa's center=True default.
             n = y.shape[0]

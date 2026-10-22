@@ -14,7 +14,13 @@ Sources:
 
 import os
 import shutil
+import sys
 import time
+
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
 
 import requests
 from dotenv import load_dotenv
@@ -221,16 +227,13 @@ def get_youtube_hits(
     # matched nothing.
     tiers = [(min_views, min_duration, max_duration)]
     if relax:
-        # Short + massively popular almost never co-occur in relevance-ranked
-        # search: the popular results are long compilations and the short
-        # ones are tiny uploads (measured: best 5-30s clip had 57 views). So
-        # widen duration first, then finally accept a proven popular longer
-        # clip -- the editor's pre_roll trims it to the crash window.
         tiers += [
             (min_views, min_duration, 60),
             (max(100_000, min_views // 10), min_duration, 60),
-            (max(50_000, min_views // 20), 3, 90),
-            (max(1_000_000, min_views), 30, 720),  # proven popular, <=12 min
+            (max(25_000, min_views // 40), 3, 90),
+            (max(5_000, min_views // 200), 3, 120),
+            (max(1_000_000, min_views), 30, 720),
+            (0, 3, 180),
         ]
 
     # Fetch every query ONCE, then apply tiers to the cached pool. Re-running
@@ -272,9 +275,15 @@ def get_youtube_hits(
     print(f"[harvester] YouTube: {len(pool)} total results, "
           f"{len(with_duration)} with duration data")
 
+    all_hits = []
+    seen_ids = set()
+
     for tier_views, tier_min_d, tier_max_d in tiers:
-        hits = []
+        tier_hits = []
         for entry in with_duration:
+            eid = entry.get("id") or ""
+            if not eid or eid in seen_ids:
+                continue
             duration = entry.get("duration") or 0
             views = entry.get("view_count") or 0
             if not (tier_min_d <= duration <= tier_max_d):
@@ -283,8 +292,7 @@ def get_youtube_hits(
                 continue
             webpage_url = (
                 entry.get("url") or entry.get("webpage_url")
-                or (f"https://www.youtube.com/watch?v={entry['id']}"
-                    if entry.get("id") else ""))
+                or (f"https://www.youtube.com/watch?v={eid}" if eid else ""))
             if not webpage_url:
                 continue
             uploader = (entry.get("uploader") or entry.get("channel") or "").strip()
@@ -301,8 +309,8 @@ def get_youtube_hits(
             else:
                 credit = "Credit: Original Creator"
 
-            hits.append({
-                "id": entry.get("id") or "",
+            item = {
+                "id": eid,
                 "source": "youtube",
                 "subreddit": "",
                 "uploader": uploader,
@@ -315,17 +323,20 @@ def get_youtube_hits(
                 "permalink": webpage_url,
                 "duration": float(duration),
                 "views": int(views),
-            })
+            }
+            seen_ids.add(eid)
+            tier_hits.append(item)
 
-        print(f"[harvester] YouTube: {len(hits)} hit(s) at "
-              f"{tier_min_d}-{tier_max_d}s / >= {tier_views:,} views")
-        if hits:
-            if tier_views != min_views or tier_min_d != min_duration:
-                print(f"[harvester] YouTube: strict window matched nothing; "
-                      f"relaxed to {tier_min_d}-{tier_max_d}s / "
-                      f"{tier_views:,} views")
-            hits.sort(key=lambda h: h["views"], reverse=True)
-            return hits
+        if tier_hits:
+            print(f"[harvester] YouTube: {len(tier_hits)} new hit(s) at "
+                  f"{tier_min_d}-{tier_max_d}s / >= {tier_views:,} views")
+            all_hits.extend(tier_hits)
+            if len(all_hits) >= 15:
+                break
+
+    if all_hits:
+        all_hits.sort(key=lambda h: h["views"], reverse=True)
+        return all_hits
 
     print("[harvester] YouTube: all thresholds exhausted, 0 hits")
     return []
