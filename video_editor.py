@@ -179,6 +179,59 @@ def create_meme_text_image(
     return img
 
 
+def create_credit_badge_image(
+    credit_text: str,
+    base_fontsize: int = 30,
+    max_width: int = 900,
+    scale: float = 1.0,
+) -> Image.Image:
+    """Render a clean, semi-transparent attribution pill badge (e.g. 'Credit: @creator')."""
+    credit = (credit_text or "").strip()
+    if len(credit) > 55:
+        credit = credit[:52] + "..."
+
+    fontsize = max(18, int(round(base_fontsize * scale)))
+    font = None
+    for candidate in ("arialbd.ttf", "arial.ttf", "DejaVuSans-Bold.ttf"):
+        try:
+            font = ImageFont.truetype(candidate, fontsize)
+            break
+        except OSError:
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+
+    probe = Image.new("RGBA", (10, 10))
+    drawer = ImageDraw.Draw(probe)
+    bbox = drawer.textbbox((0, 0), credit, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+
+    pad_x = max(12, int(round(22 * scale)))
+    pad_y = max(6, int(round(10 * scale)))
+    w = min(int(round(max_width * scale)), text_w + pad_x * 2)
+    h = text_h + pad_y * 2
+
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    # Subtle translucent dark pill with light border
+    radius = h // 2
+    draw.rounded_rectangle(
+        [0, 0, w - 1, h - 1],
+        radius=radius,
+        fill=(0, 0, 0, 160),
+        outline=(255, 255, 255, 60),
+        width=max(1, int(round(1 * scale))),
+    )
+
+    # Centered text in clear, high-legibility white
+    tx = (w - text_w) // 2
+    ty = (h - text_h) // 2 - bbox[1] // 2
+    draw.text((tx, ty), credit, font=font, fill=(255, 255, 255, 240))
+    return img
+
+
 def build_9_16_base(clip, target_w: int = TARGET_W,
                     target_h: int = TARGET_H) -> CompositeVideoClip:
     """Center wide footage onto a blurred vertical 9:16 background.
@@ -209,6 +262,7 @@ def assemble_meme_edit_with_freeze_and_caption(
     output_path: str,
     freeze_duration: float = 1.0,
     pre_roll: float = 6.0,
+    credit_text: str = None,
 ) -> str:
     """Assemble the full meme edit and export to output_path.
 
@@ -333,6 +387,18 @@ def assemble_meme_edit_with_freeze_and_caption(
     # kwargs (positional fps is ignored -> None -> writer crash).
     final = concatenate_videoclips([seg1, seg2, seg3], method="compose")
     final.fps = int(fps)
+
+    # Optional attribution watermark (credit pill badge)
+    if credit_text and credit_text.strip():
+        try:
+            badge_img = create_credit_badge_image(credit_text.strip(), scale=_scale)
+            badge_clip = (ImageClip(np.array(badge_img))
+                          .set_duration(final.duration)
+                          .set_position(("center", 0.08), relative=True))
+            final = CompositeVideoClip([final, badge_clip], size=(_tw, _th))
+            final.fps = int(fps)
+        except Exception as exc:
+            print(f"[editor] credit watermark failed ({exc}); continuing without badge")
 
     # Encode at edit res, then upscale to 1080x1920 in one cheap pass.
     edit_path = (os.path.splitext(output_path)[0] + "_edit.mp4"

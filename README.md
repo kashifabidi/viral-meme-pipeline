@@ -26,19 +26,25 @@ python main.py --input downloads\test_clip.mp4   # single video (path or URL)
 python main.py --harvest                          # auto-source viral clips
 ```
 
-## Harvesting (zero auth)
+## Harvesting (zero auth & funny clip targeting)
 `--harvest` pulls candidates from two credential-free sources via
-`get_viral_candidates()`:
+`get_viral_candidates()`, tuned specifically for funny and Creative Commons (open reuse) clips:
 
-1. **Reddit public JSON** - GETs `/r/<sub>/top.json?t=all&limit=N` with a
-   browser User-Agent (no OAuth/PRAW), keeping native video posts
-   (`is_video` or `v.redd.it`) scoring >= 25,000.
-   Reddit 403s public `.json` from many datacenter/cloud IPs. If blocked the
-   harvester prints the reason and moves on instead of failing the run.
-2. **YouTube search** - yt-dlp `ytsearchN:`, filtered to 5-30s clips with
-   >= 1M views. Real search returns mostly long compilations, so if the
-   strict window matches nothing the thresholds relax progressively
-   (wider window, then lower view floor) and the run reports which tier hit.
+1. **Reddit comedy communities** - Scans `/r/<sub>/top.json?t=all&limit=N`
+   across top comedy/humor hubs: `funny`, `Unexpected`, `ContagiousLaughter`,
+   `maybemaybemaybe`, `Whatcouldgowrong`, `therewasanattempt`, `AnimalsBeingDerps`,
+   `holdmybeer`, `IdiotsInCars`, and `facepalm`.
+   Captures original post authors and automatically formats on-screen credit badges (`Credit: u/author (r/subreddit)`).
+2. **YouTube Creative Commons & viral comedy** - Searches specifically for funny fails,
+   accidents, pet comedy, and Creative Commons Attribution clips (e.g. `funny fails creative commons`,
+   `funny animal fails creative commons`, `unexpected funny fails cc`).
+   Detects CC-BY licenses and creator handles, automatically embedding an on-screen attribution pill (`Credit: @creator (CC-BY)`).
+
+## Attribution & Open Source Watermarking
+To ensure open source and community creators are respected:
+- Every harvested clip automatically tracks creator metadata in a `.meta.json` sidecar.
+- An elegant, semi-transparent pill badge is overlaid near the top (`Credit: @creator (CC-BY)` or `Credit: u/author (r/sub)`) throughout the video.
+- Stays safely within mobile safe-zones for YouTube Shorts, Instagram Reels, and TikTok.
 
 Results are interleaved by rank rather than concatenated, so one dead source
 can't bury the other. Downloads try the permalink, then the direct

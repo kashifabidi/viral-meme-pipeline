@@ -214,6 +214,15 @@ def stage_trim(video_path: str, climax: float):
         log.warning("Trim produced no file; using full source.")
         return video_path, climax
 
+    meta_src = os.path.splitext(video_path)[0] + ".meta.json"
+    meta_dst = os.path.splitext(trimmed)[0] + ".meta.json"
+    if os.path.isfile(meta_src):
+        try:
+            import shutil
+            shutil.copy2(meta_src, meta_dst)
+        except OSError:
+            pass
+
     log.info("Trimmed %.1fs source to %.1fs window (%.1fs..%.1fs) -> %s",
              total, length, start, start + length, os.path.basename(trimmed))
     return trimmed, climax - start
@@ -231,8 +240,20 @@ def stage_caption(video_path: str, climax: float) -> str:
         raise SystemExit(4)
 
 
-def stage_render(video_path, climax, caption) -> str:
+def stage_render(video_path, climax, caption, credit=None) -> str:
     from video_editor import assemble_meme_edit_with_freeze_and_caption
+
+    meta_path = os.path.splitext(video_path)[0] + ".meta.json"
+    if not credit and os.path.isfile(meta_path):
+        try:
+            import json
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+                credit = meta.get("credit")
+        except Exception:
+            pass
+    if credit:
+        log.info("Attribution: %s", credit)
 
     # Two DISTINCT SFX: scratch on the freeze, boom on the resume.
     scratch, boom = _pick_files(SFX_DIR, AUDIO_EXTS, count=2)
@@ -250,7 +271,8 @@ def stage_render(video_path, climax, caption) -> str:
     out = os.path.abspath(os.path.join(OUTPUT_DIR, f"meme_{stamp}.mp4"))
     try:
         assemble_meme_edit_with_freeze_and_caption(
-            video_path, climax, caption, scratch, boom, overlay, out)
+            video_path, climax, caption, scratch, boom, overlay, out,
+            credit_text=credit)
         log.info("Rendered -> %s", out)
         return out
     except Exception as exc:
@@ -323,6 +345,12 @@ def main(argv=None) -> int:
                 os.remove(work)
             except OSError:
                 pass
+            meta_work = os.path.splitext(work)[0] + ".meta.json"
+            if os.path.isfile(meta_work):
+                try:
+                    os.remove(meta_work)
+                except OSError:
+                    pass
         # Downloads are only worth keeping for --input debugging; in harvest
         # mode they would accumulate until the disk fills.
         if args.harvest:
@@ -330,6 +358,12 @@ def main(argv=None) -> int:
                 os.remove(video)
             except OSError:
                 pass
+            meta_video = os.path.splitext(video)[0] + ".meta.json"
+            if os.path.isfile(meta_video):
+                try:
+                    os.remove(meta_video)
+                except OSError:
+                    pass
 
     log.info("=== PIPELINE DONE in %.1fs: %d ok, %d failed ===",
              time.time() - t0, ok, failed)

@@ -21,9 +21,33 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DEFAULT_SUBREDDITS = ["Whatcouldgowrong", "therewasanattempt", "holdmybeer"]
-DEFAULT_YT_QUERIES = ["instant regret fail shorts", "perfectly cut fails",
-                      "fail shorts", "instant karma shorts"]
+DEFAULT_SUBREDDITS = [
+    "funny",
+    "Unexpected",
+    "ContagiousLaughter",
+    "maybemaybemaybe",
+    "Whatcouldgowrong",
+    "therewasanattempt",
+    "AnimalsBeingDerps",
+    "holdmybeer",
+    "IdiotsInCars",
+    "facepalm",
+]
+DEFAULT_YT_QUERIES = [
+    # Creative Commons / Open reuse funny clips (attribution-friendly)
+    "funny fails creative commons",
+    "funny animal fails creative commons",
+    "funny accidents moments creative commons",
+    "unexpected funny fails creative commons",
+    "try not to laugh creative commons",
+    "meme clips creative commons",
+    # Viral funny & comedy shorts
+    "funny fail shorts",
+    "instant regret funny shorts",
+    "perfectly cut screams funny",
+    "instant karma funny fails",
+    "animals being derps funny shorts",
+]
 
 # Reddit returns 403 on public .json for many datacenter/cloud IPs (and to
 # generic clients). A browser UA helps but is not a guarantee. When a request
@@ -94,19 +118,26 @@ def _normalize_reddit_hit(data: dict, subreddit: str):
         return None
 
     score = int(data.get("score") or 0)
+    author = (data.get("author") or "").strip()
+    if author and author.lower() not in ("[deleted]", "[removed]"):
+        credit = f"Credit: u/{author} (r/{subreddit})"
+    else:
+        credit = f"Credit: r/{subreddit}"
+
     return {
         "id": data.get("id") or "",
         "source": "reddit",
         "subreddit": subreddit,
+        "author": author,
         "title": (data.get("title") or "").strip(),
         "score": score,
-        # yt-dlp handles the permalink and muxes video+audio for us.
         "url": f"https://www.reddit.com{permalink}",
-        # Direct v.redd.it MP4 as a backup if the permalink route fails.
         "fallback_url": fallback_url or "",
         "permalink": f"https://reddit.com{permalink}",
         "duration": 0.0,
         "views": score,
+        "license": "Reddit Community",
+        "credit": credit,
     }
 
 
@@ -256,11 +287,28 @@ def get_youtube_hits(
                     if entry.get("id") else ""))
             if not webpage_url:
                 continue
+            uploader = (entry.get("uploader") or entry.get("channel") or "").strip()
+            license_type = (entry.get("license") or "").strip()
+            title = (entry.get("title") or "").strip()
+            is_cc = (
+                "creative commons" in license_type.lower()
+                or "creative commons" in title.lower()
+                or "cc-by" in title.lower()
+                or "cc by" in title.lower()
+            )
+            if uploader:
+                credit = f"Credit: @{uploader} (CC-BY)" if is_cc else f"Credit: @{uploader}"
+            else:
+                credit = "Credit: Original Creator"
+
             hits.append({
                 "id": entry.get("id") or "",
                 "source": "youtube",
                 "subreddit": "",
-                "title": (entry.get("title") or "").strip(),
+                "uploader": uploader,
+                "license": license_type or ("Creative Commons" if is_cc else "Standard"),
+                "credit": credit,
+                "title": title,
                 "score": int(views),
                 "url": webpage_url,
                 "fallback_url": "",
@@ -310,7 +358,7 @@ def download_candidate(hit: dict, output_folder: str = "downloads") -> str:
         if not url:
             continue
         try:
-            return download_source_video(url, output_folder)
+            return download_source_video(url, output_folder, hit_metadata=hit)
         except Exception as exc:
             last_err = exc
             print(f"[harvester] download failed for {url}: {exc}")
@@ -338,7 +386,7 @@ def _ffmpeg_location():
     return None, ffmpeg_path
 
 
-def download_source_video(url: str, output_folder: str = "downloads") -> str:
+def download_source_video(url: str, output_folder: str = "downloads", hit_metadata: dict = None) -> str:
     """Download highest-quality single MP4 via yt-dlp, return local path.
 
     Reddit/YouTube serve video-only and audio-only streams, so bv*+ba/b pairs
@@ -383,6 +431,37 @@ def download_source_video(url: str, output_folder: str = "downloads") -> str:
             path = alt if os.path.isfile(alt) else path
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Download finished but file missing: {path}")
+
+        meta_path = os.path.splitext(path)[0] + ".meta.json"
+        uploader = ((hit_metadata or {}).get("uploader")
+                    or (hit_metadata or {}).get("author")
+                    or info.get("uploader")
+                    or info.get("channel") or "")
+        lic = (hit_metadata or {}).get("license") or info.get("license") or ""
+        is_cc = "creative commons" in str(lic).lower() or "cc" in (info.get("title") or "").lower()
+        if (hit_metadata or {}).get("credit"):
+            credit = hit_metadata["credit"]
+        elif uploader:
+            credit = f"Credit: @{uploader} (CC-BY)" if is_cc else f"Credit: @{uploader}"
+        else:
+            credit = "Credit: Original Creator"
+
+        meta = {
+            "id": info.get("id") or (hit_metadata or {}).get("id") or "",
+            "title": info.get("title") or (hit_metadata or {}).get("title") or "",
+            "uploader": uploader,
+            "license": lic or ("Creative Commons" if is_cc else "Standard"),
+            "credit": credit,
+            "url": url,
+            "source": (hit_metadata or {}).get("source") or ("youtube" if "youtube" in url or "youtu.be" in url else "web"),
+        }
+        try:
+            import json
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
+        except Exception:
+            pass
+
         return os.path.abspath(path)
 
 
