@@ -12,3 +12,4 @@ google-auth-httplib2
 google-auth-oauthlib
 python-dotenv
 torch>=2.2.0
+edge-tts

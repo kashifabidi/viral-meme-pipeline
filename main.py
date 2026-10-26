@@ -9,6 +9,7 @@ Usage:
 import argparse
 import logging
 import os
+from pathlib import Path
 import random
 import subprocess
 import sys
@@ -22,6 +23,8 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 
+ENV_PATH = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=ENV_PATH)
 load_dotenv()
 
 logging.basicConfig(
@@ -46,6 +49,25 @@ AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac")
 TRIM_THRESHOLD = 60.0
 PRE_ROLL_SRC = 8.0   # seconds of lead-in kept before the climax
 POST_ROLL = 3.0      # seconds kept after the climax
+
+
+def _safe_remove(file_path: str, retries: int = 5, delay: float = 0.2) -> bool:
+    """Safely delete a file on Windows, retrying on transient WinError 32 file locks."""
+    if not file_path or not os.path.isfile(file_path):
+        return True
+    import gc
+    gc.collect()
+    for attempt in range(retries):
+        try:
+            os.remove(file_path)
+            return True
+        except OSError as exc:
+            if attempt < retries - 1:
+                time.sleep(delay)
+            else:
+                log.warning("Could not remove %s: %s", file_path, exc)
+                return False
+    return False
 
 
 def _list_files(folder, exts):
@@ -110,7 +132,7 @@ def stage_acquire(args) -> str:
         try:
             path = download_candidate(cand)
             log.info("Downloaded -> %s", path)
-            return [path]
+            return path
         except Exception as exc:
             log.warning("Candidate failed (%s), trying next...", exc)
             continue
@@ -127,7 +149,10 @@ def stage_acquire_batch(args, max_items: int):
     flaky source or an un-downloadable clip doesn't cost the whole run.
     """
     if args.input:
-        return stage_acquire(args)
+        single_path = stage_acquire(args)
+        if isinstance(single_path, list):
+            return single_path
+        return [single_path] if single_path else []
 
     from viral_harvester import download_candidate, get_viral_candidates
 
@@ -204,7 +229,7 @@ def stage_trim(video_path: str, climax: float):
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     trimmed = os.path.abspath(os.path.join("downloads", f"clip_{stamp}.mp4"))
     cmd = [
-        _resolve_ffmpeg_bin("ffmpeg"), "-y", "-ss", f"{start:.3f}",
+        _resolve_ffmpeg_bin("ffmpeg"), "-y", "-nostdin", "-ss", f"{start:.3f}",
         "-i", video_path, "-t", f"{length:.3f}",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
         "-c:a", "aac", trimmed,
@@ -233,19 +258,22 @@ def stage_trim(video_path: str, climax: float):
     return trimmed, climax - start
 
 
-def stage_caption(video_path: str, climax: float) -> str:
+def stage_caption(video_path: str, climax: float) -> tuple[str, str]:
     from caption_generator import get_freeze_caption
+    from video_editor import HOOK_TEMPLATES
 
     try:
         cap = get_freeze_caption(video_path, climax)
         log.info("Caption: %s", cap)
-        return cap
+        hook = random.choice(HOOK_TEMPLATES) if HOOK_TEMPLATES else "Wait for it"
+        log.info("Hook text: %s", hook)
+        return cap, hook
     except Exception as exc:
         log.error("STAGE caption FAILED: %s", exc)
         raise SystemExit(4)
 
 
-def stage_render(video_path, climax, caption, credit=None, hook_text=None) -> str:
+def stage_render(video_path, climax, caption, credit=None, hook_text=None, voiceover_path=None) -> str:
     from video_editor import assemble_meme_edit_with_freeze_and_caption
 
     meta_path = os.path.splitext(video_path)[0] + ".meta.json"
@@ -258,8 +286,7 @@ def stage_render(video_path, climax, caption, credit=None, hook_text=None) -> st
         except Exception:
             pass
 
-    if not credit:
-        credit = meta.get("credit")
+    credit = credit or meta.get("credit") or "Credit: Original Creator"
     if credit:
         log.info("Attribution: %s", credit)
 
@@ -284,7 +311,7 @@ def stage_render(video_path, climax, caption, credit=None, hook_text=None) -> st
     try:
         assemble_meme_edit_with_freeze_and_caption(
             video_path, climax, caption, scratch, boom, overlay, out,
-            credit_text=credit, hook_text=hook_text)
+            credit_text=credit, hook_text=hook_text, voiceover_path=voiceover_path)
         log.info("Rendered -> %s", out)
         return out
     except Exception as exc:
@@ -335,11 +362,31 @@ def main(argv=None) -> int:
             log.info("--- item %d/%d: %s ---", idx, len(sources),
                      os.path.basename(video))
         work = video  # intermediate trim path; distinct from source when trimmed
+        vo_path = None
         try:
             climax = stage_climax(video)              # (b) crash timestamp
             work, climax = stage_trim(video, climax)  # (b2) window long clips
-            caption = stage_caption(work, climax)     # (c) punchline caption
-            final = stage_render(work, climax, caption)  # (d+e) 9:16 edit
+            caption_res = stage_caption(work, climax) # (c) punchline caption & hook
+            if isinstance(caption_res, (tuple, list)):
+                caption = caption_res[0]
+                hook_text = caption_res[1] if len(caption_res) > 1 else None
+            else:
+                caption = caption_res
+                hook_text = None
+
+            if not hook_text:
+                from video_editor import HOOK_TEMPLATES
+                hook_text = random.choice(HOOK_TEMPLATES) if HOOK_TEMPLATES else "Wait for it"
+
+            try:
+                import tts_generator
+                vo_path, vo_dur = tts_generator.synthesize_hook_voiceover(hook_text)
+                log.info("Voiceover synthesized (%.2fs) -> %s", vo_dur, vo_path)
+            except Exception as vo_exc:
+                log.warning("Voiceover synthesis failed (%s); continuing without VO", vo_exc)
+                vo_path = None
+
+            final = stage_render(work, climax, caption, hook_text=hook_text, voiceover_path=vo_path)  # (d+e) 9:16 edit
             fid, link = stage_upload(final,
                                      keep_local=args.keep_local)  # (f)
             if link:
@@ -350,32 +397,22 @@ def main(argv=None) -> int:
             failed += 1
             log.error("item %d aborted (exit %s); continuing with next.",
                       idx, exc.code)
-
-        # Remove the intermediate trimmed copy (the download stays for re-runs).
-        if work != video:
-            try:
-                os.remove(work)
-            except OSError:
-                pass
-            meta_work = os.path.splitext(work)[0] + ".meta.json"
-            if os.path.isfile(meta_work):
-                try:
-                    os.remove(meta_work)
-                except OSError:
-                    pass
-        # Downloads are only worth keeping for --input debugging; in harvest
-        # mode they would accumulate until the disk fills.
-        if args.harvest:
-            try:
-                os.remove(video)
-            except OSError:
-                pass
-            meta_video = os.path.splitext(video)[0] + ".meta.json"
-            if os.path.isfile(meta_video):
-                try:
-                    os.remove(meta_video)
-                except OSError:
-                    pass
+        except Exception as exc:
+            failed += 1
+            log.error("item %d aborted with unhandled error (%s); continuing with next.",
+                      idx, exc)
+        finally:
+            if vo_path:
+                _safe_remove(vo_path)
+            # Remove the intermediate trimmed copy safely (the download stays for re-runs).
+            if work != video:
+                _safe_remove(work)
+                _safe_remove(os.path.splitext(work)[0] + ".meta.json")
+            # Downloads are only worth keeping for --input debugging; in harvest
+            # mode they would accumulate until the disk fills.
+            if args.harvest:
+                _safe_remove(video)
+                _safe_remove(os.path.splitext(video)[0] + ".meta.json")
 
     log.info("=== PIPELINE DONE in %.1fs: %d ok, %d failed ===",
              time.time() - t0, ok, failed)

@@ -11,6 +11,7 @@ Pipeline:
 import os
 import shutil
 import subprocess
+import time
 
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
@@ -67,6 +68,7 @@ from moviepy.editor import (
     ImageClip,
     VideoFileClip,
     concatenate_videoclips,
+    concatenate_audioclips,
 )
 
 TARGET_W, TARGET_H = 1080, 1920  # 9:16 vertical
@@ -102,22 +104,6 @@ except ValueError:
           f"number; using {RENDER_SCALE}")
 
 
-def _resolve_ffmpeg() -> str:
-    found = shutil.which("ffmpeg")
-    if found:
-        return found
-    base = os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                        "Microsoft", "WinGet", "Packages")
-    try:
-        for entry in os.listdir(base):
-            if "Gyan.FFmpeg" in entry:
-                for root, _d, files in os.walk(os.path.join(base, entry)):
-                    if "ffmpeg.exe" in files:
-                        return os.path.join(root, "ffmpeg.exe")
-    except OSError:
-        pass
-    return "ffmpeg"
-
 
 # Make moviepy's ffmpeg calls work even when PATH lacks the WinGet shim.
 os.environ["IMAGEIO_FFMPEG_EXE"] = _resolve_ffmpeg()
@@ -126,6 +112,57 @@ try:
     change_settings({"FFMPEG_BINARY": os.environ["IMAGEIO_FFMPEG_EXE"]})
 except Exception:
     pass
+
+
+def _safe_remove(file_path: str, retries: int = 5, delay: float = 0.2) -> bool:
+    """Safely delete a file on Windows, retrying on transient WinError 32 file locks."""
+    if not file_path or not os.path.isfile(file_path):
+        return True
+    import gc
+    gc.collect()
+    for attempt in range(retries):
+        try:
+            os.remove(file_path)
+            return True
+        except OSError:
+            if attempt < retries - 1:
+                time.sleep(delay)
+            else:
+                return False
+    return False
+
+
+def _safe_close_clip(clip, visited=None):
+    """Safely release and close MoviePy clips and underlying reader processes."""
+    if clip is None:
+        return
+    if visited is None:
+        visited = set()
+    clip_id = id(clip)
+    if clip_id in visited:
+        return
+    visited.add(clip_id)
+    try:
+        if hasattr(clip, "reader") and clip.reader:
+            try:
+                if hasattr(clip.reader, "close"):
+                    clip.reader.close()
+                elif hasattr(clip.reader, "close_proc"):
+                    clip.reader.close_proc()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        if hasattr(clip, "audio") and clip.audio and clip.audio != clip:
+            _safe_close_clip(clip.audio, visited=visited)
+    except Exception:
+        pass
+    try:
+        if hasattr(clip, "close"):
+            clip.close()
+    except Exception:
+        pass
 
 
 def _load_sfx(path: str):
@@ -221,19 +258,19 @@ def create_meme_text_image(
 
 
 HOOK_TEMPLATES = [
-    "WAIT FOR IT... ??",
-    "BRO REALLY THOUGHT ??",
-    "HE REGRETTED THIS IMMEDIATELY ??",
-    "NO WAY THIS JUST HAPPENED ??",
-    "NEVER LET THEM KNOW YOUR NEXT MOVE ??",
-    "TOP 10 MOMENTS BEFORE DISASTER ??",
-    "TASK FAILED SUCCESSFULLY ??",
-    "WATCH TILL THE END ??",
-    "INSTANT REGRET ??",
-    "CALCULATED RISK ??",
-    "IT KEEPS GETTING WORSE ??",
-    "WHO DID THIS ????",
-    "PHYSICS HAS LEFT THE CHAT ??",
+    "WAIT FOR IT... 💀",
+    "BRO REALLY THOUGHT 😭",
+    "HE REGRETTED THIS IMMEDIATELY 💀",
+    "NO WAY THIS JUST HAPPENED 😱",
+    "NEVER LET THEM KNOW YOUR NEXT MOVE 🧠",
+    "TOP 10 MOMENTS BEFORE DISASTER ⚠️",
+    "TASK FAILED SUCCESSFULLY 😂",
+    "WATCH TILL THE END 🔥",
+    "INSTANT REGRET 💀",
+    "CALCULATED RISK 📉",
+    "IT KEEPS GETTING WORSE 💀",
+    "WHO DID THIS 😭",
+    "PHYSICS HAS LEFT THE CHAT 💀",
 ]
 
 
@@ -373,6 +410,7 @@ def assemble_meme_edit_with_freeze_and_caption(
     pre_roll: float = 6.0,
     credit_text: str = None,
     hook_text: str = None,
+    voiceover_path: str = None,
 ) -> str:
     """Assemble the full meme edit and export to output_path.
 
@@ -387,197 +425,249 @@ def assemble_meme_edit_with_freeze_and_caption(
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    src = VideoFileClip(raw_video_path)
-    # Pre-scale oversized wide sources (e.g. 1440p/4K harvests) to 720p-wide
-    # before any editing: cuts per-frame PIL blur + encode cost ~3x.
-    # Portrait clips (w < h) skip this -- they are already phone-shaped.
+    src = None
+    scratch = None
+    boom = None
+    final = None
+    temp_audio = None
+    clips_to_close = []
     try:
-        if src.w > MAX_INPUT_WIDTH and src.w >= src.h:
-            src = src.resize(width=MAX_INPUT_WIDTH)
-    except Exception:
-        pass
-    fps = src.fps or 30
-    total = src.duration or 0.0
-    climax = max(0.0, min(float(climax_timestamp), max(0.0, total - 0.05)))
-
-    # Edit at RENDER_SCALE then upscale (see module header for the numbers):
-    # render cost scales with OUTPUT pixels, so building at 810x1440 and
-    # letting ffmpeg upscale is ~1.6x faster than editing at 1080x1920.
-    # Dimensions are passed explicitly -- no global mutation.
-    _scale = float(globals().get("RENDER_SCALE", 1.0) or 1.0)
-    if not (0 < _scale < 1.0):
-        _scale = 1.0
-    _tw, _th = int(TARGET_W * _scale), int(TARGET_H * _scale)
-
-    # Segment 1: pre-roll leading into the climax, capped at pre_roll seconds
-    # so long sources still produce a Short-sized edit.
-    seg_start = max(0.0, climax - max(0.0, pre_roll))
-    seg_end = climax
-    if seg_end - seg_start < 0.05:
-        # Climax sits near the source start: nudge forward so the clip is
-        # never zero-length.
-        seg_end = min(total, max(seg_start + 0.05, climax))
-        if seg_end - seg_start < 0.05:
-            seg_start = max(0.0, seg_end - 0.05)
-    seg1_raw = src.subclip(seg_start, seg_end)
-    seg1 = build_9_16_base(seg1_raw, _tw, _th).set_fps(fps)
-
-    # Segment 2: freeze-frame + scratch SFX + caption.
-    freeze_t = min(climax, max(0.0, total - 1e-3))
-    freeze_frame = src.get_frame(freeze_t)
-    bg_img = _pil_blurred_background(freeze_frame, _tw, _th)
-    bg_clip = (ImageClip(np.array(bg_img))
-               .set_duration(freeze_duration)
-               .set_fps(fps))
-    sw, sh = src.w, src.h
-    fg_w = _tw
-    fg_h = int(round(sh * (_tw / sw)))
-    if fg_h > _th:
-        fg_h = _th
-        fg_w = int(round(sw * (_th / sh)))
-    frozen_fg = (ImageClip(freeze_frame)
-                 .resize(newsize=(fg_w, fg_h))
-                 .set_duration(freeze_duration)
-                 .set_position("center"))
-    # Caption + overlay are sized in absolute px, so scale them to match
-    # the edit resolution (font 84 / width 940 / overlay 520 are the
-    # 1080-wide reference values).
-    caption_img = create_meme_text_image(
-        caption_text or '"..."',
-        fontsize=max(28, int(round(84 * _scale))),
-        max_width=max(320, int(round(940 * _scale))),
-    )
-    caption_clip = (ImageClip(np.array(caption_img))
-                    .set_duration(freeze_duration)
-                    .set_position(("center", 0.62), relative=True))
-    seg2 = CompositeVideoClip([bg_clip, frozen_fg, caption_clip],
-                              size=(_tw, _th)).set_fps(fps)
-    scratch = _load_sfx(record_scratch_sfx)
-    if scratch is not None:
-        if scratch.duration and scratch.duration > freeze_duration:
-            scratch = scratch.subclip(0, freeze_duration)
-        seg2 = seg2.set_audio(scratch)
-    else:
-        seg2 = seg2.without_audio()
-
-    # Segment 3: resume with impact SFX + overlay cutout (capped to 3.5s punchline).
-    post_roll = 3.5
-    if climax < total - 0.05:
-        tail_end = min(total, climax + post_roll)
-        tail_raw = src.subclip(climax, tail_end)
-    else:
-        tail_raw = src.subclip(max(0.0, total - 0.5))
-    seg3_base = build_9_16_base(tail_raw, _tw, _th)
-    overlays = []
-    if overlay_image_path and os.path.isfile(overlay_image_path):
+        src = VideoFileClip(raw_video_path)
+        clips_to_close.append(src)
+        # Pre-scale oversized wide sources (e.g. 1440p/4K harvests) to 720p-wide
+        # before any editing: cuts per-frame PIL blur + encode cost ~3x.
+        # Portrait clips (w < h) skip this -- they are already phone-shaped.
         try:
-            ov_dur = min(1.2, tail_raw.duration or 1.2)
-            ov = (ImageClip(overlay_image_path)
-                  .set_duration(ov_dur)
-                  .resize(width=max(160, int(520 * _scale)))
-                  .set_position(("center", 0.30), relative=True))
-            if ov.duration and ov.duration > 0.3:
-                ov = ov.crossfadein(0.12)
-            overlays.append(ov)
+            if src.w > MAX_INPUT_WIDTH and src.w >= src.h:
+                src = src.resize(width=MAX_INPUT_WIDTH)
         except Exception:
             pass
-    if overlays:
-        seg3 = CompositeVideoClip([seg3_base] + overlays,
+        fps = src.fps or 30
+        total = src.duration or 0.0
+        climax = max(0.0, min(float(climax_timestamp), max(0.0, total - 0.05)))
+
+        # Edit at RENDER_SCALE then upscale (see module header for the numbers):
+        # render cost scales with OUTPUT pixels, so building at 810x1440 and
+        # letting ffmpeg upscale is ~1.6x faster than editing at 1080x1920.
+        # Dimensions are passed explicitly -- no global mutation.
+        _scale = float(globals().get("RENDER_SCALE", 1.0) or 1.0)
+        if not (0 < _scale < 1.0):
+            _scale = 1.0
+        _tw, _th = int(TARGET_W * _scale), int(TARGET_H * _scale)
+
+        # Segment 1: pre-roll leading into the climax, capped at pre_roll seconds
+        # so long sources still produce a Short-sized edit.
+        seg_start = max(0.0, climax - max(0.0, pre_roll))
+        seg_end = climax
+        if seg_end - seg_start < 0.05:
+            # Climax sits near the source start: nudge forward so the clip is
+            # never zero-length.
+            seg_end = min(total, max(seg_start + 0.05, climax))
+            if seg_end - seg_start < 0.05:
+                seg_start = max(0.0, seg_end - 0.05)
+        seg1_raw = src.subclip(seg_start, seg_end)
+        seg1 = build_9_16_base(seg1_raw, _tw, _th).set_fps(fps)
+
+        # Voiceover audio load & Segment 1 ducking
+        vo_clip = None
+        vo_dur = 0.0
+        if voiceover_path and os.path.isfile(voiceover_path):
+            try:
+                vo_clip = AudioFileClip(voiceover_path)
+                clips_to_close.append(vo_clip)
+                vo_dur = float(vo_clip.duration or 0.0)
+            except Exception as exc:
+                print(f"[editor] voiceover load failed ({exc}); proceeding without it")
+                vo_clip = None
+                vo_dur = 0.0
+
+        if vo_clip is not None and vo_dur > 0:
+            seg1_dur = float(seg1.duration or (seg_end - seg_start))
+            effective_vo_dur = min(vo_dur, seg1_dur)
+            vo_track = vo_clip.volumex(0.90).set_start(0.0)
+            if vo_dur > seg1_dur:
+                vo_track = vo_track.subclip(0, seg1_dur)
+
+            if seg1.audio is not None:
+                audio_dur = float(seg1.audio.duration or seg1_dur)
+                duck_len = min(effective_vo_dur, audio_dur)
+                if duck_len < audio_dur:
+                    ducked_part = seg1.audio.subclip(0, duck_len).volumex(0.20)
+                    rest_part = seg1.audio.subclip(duck_len, audio_dur).volumex(1.0)
+                    ducked_src = concatenate_audioclips([ducked_part, rest_part])
+                else:
+                    ducked_src = seg1.audio.volumex(0.20)
+                seg1 = seg1.set_audio(CompositeAudioClip([ducked_src, vo_track]))
+            else:
+                seg1 = seg1.set_audio(CompositeAudioClip([vo_track]))
+
+        # Segment 2: freeze-frame + scratch SFX + caption.
+        freeze_t = min(climax, max(0.0, total - 1e-3))
+        freeze_frame = src.get_frame(freeze_t)
+        bg_img = _pil_blurred_background(freeze_frame, _tw, _th)
+        bg_clip = (ImageClip(np.array(bg_img))
+                   .set_duration(freeze_duration)
+                   .set_fps(fps))
+        sw, sh = src.w, src.h
+        fg_w = _tw
+        fg_h = int(round(sh * (_tw / sw)))
+        if fg_h > _th:
+            fg_h = _th
+            fg_w = int(round(sw * (_th / sh)))
+        frozen_fg = (ImageClip(freeze_frame)
+                     .resize(newsize=(fg_w, fg_h))
+                     .set_duration(freeze_duration)
+                     .set_position("center"))
+        # Caption + overlay are sized in absolute px, so scale them to match
+        # the edit resolution (font 84 / width 940 / overlay 520 are the
+        # 1080-wide reference values).
+        caption_img = create_meme_text_image(
+            caption_text or '"..."',
+            fontsize=max(28, int(round(84 * _scale))),
+            max_width=max(320, int(round(940 * _scale))),
+        )
+        caption_clip = (ImageClip(np.array(caption_img))
+                        .set_duration(freeze_duration)
+                        .set_position(("center", 0.62), relative=True))
+        seg2 = CompositeVideoClip([bg_clip, frozen_fg, caption_clip],
                                   size=(_tw, _th)).set_fps(fps)
-    else:
-        seg3 = seg3_base.set_fps(fps)
-    boom = _load_sfx(impact_sfx)
-    if boom is not None:
-        base_audio = seg3.audio
-        tracks = [boom.set_start(0.0)]
-        if base_audio is not None:
-            tracks.append(base_audio)
-        seg3 = seg3.set_audio(CompositeAudioClip(tracks))
+        scratch = _load_sfx(record_scratch_sfx)
+        if scratch is not None:
+            clips_to_close.append(scratch)
+            if scratch.duration and scratch.duration > freeze_duration:
+                scratch = scratch.subclip(0, freeze_duration)
+            seg2 = seg2.set_audio(scratch)
+        else:
+            seg2 = seg2.without_audio()
 
-    # Concatenate + export. fps passed explicitly as int keyword:
-    # moviepy 1.0.3's use_clip_fps_by_default only picks up fps from
-    # kwargs (positional fps is ignored -> None -> writer crash).
-    final = concatenate_videoclips([seg1, seg2, seg3], method="compose")
-    final.fps = int(fps)
+        # Segment 3: resume with impact SFX + overlay cutout (capped to 3.5s punchline).
+        post_roll = 3.5
+        if climax < total - 0.05:
+            tail_end = min(total, climax + post_roll)
+            tail_raw = src.subclip(climax, tail_end)
+        else:
+            tail_raw = src.subclip(max(0.0, total - 0.5))
+        seg3_base = build_9_16_base(tail_raw, _tw, _th)
+        overlays = []
+        if overlay_image_path and os.path.isfile(overlay_image_path):
+            try:
+                ov_dur = min(1.2, tail_raw.duration or 1.2)
+                ov = (ImageClip(overlay_image_path)
+                      .set_duration(ov_dur)
+                      .resize(width=max(160, int(520 * _scale)))
+                      .set_position(("center", 0.30), relative=True))
+                if ov.duration and ov.duration > 0.3:
+                    ov = ov.crossfadein(0.12)
+                overlays.append(ov)
+            except Exception:
+                pass
+        if overlays:
+            seg3 = CompositeVideoClip([seg3_base] + overlays,
+                                      size=(_tw, _th)).set_fps(fps)
+        else:
+            seg3 = seg3_base.set_fps(fps)
+        boom = _load_sfx(impact_sfx)
+        if boom is not None:
+            clips_to_close.append(boom)
+            base_audio = seg3.audio
+            tracks = [boom.set_start(0.0)]
+            if base_audio is not None:
+                tracks.append(base_audio)
+            seg3 = seg3.set_audio(CompositeAudioClip(tracks))
 
-    import random
-
-    extra_layers = [final]
-
-    # 1. Attribution watermark (credit pill badge)
-    if credit_text and credit_text.strip():
-        try:
-            badge_img = create_credit_badge_image(credit_text.strip(), scale=_scale)
-            badge_clip = (ImageClip(np.array(badge_img))
-                          .set_duration(final.duration)
-                          .set_position(("center", 0.06), relative=True))
-            extra_layers.append(badge_clip)
-        except Exception as exc:
-            print(f"[editor] credit watermark failed ({exc}); continuing without badge")
-
-    # 2. Viral Hook Header Banner (Top retention hook)
-    if hook_text is None and HOOK_TEMPLATES:
-        hook_text = random.choice(HOOK_TEMPLATES)
-    if hook_text and hook_text.strip():
-        try:
-            hook_img = create_hook_banner_image(hook_text.strip(), scale=_scale)
-            hook_clip = (ImageClip(np.array(hook_img))
-                         .set_duration(final.duration)
-                         .set_position(("center", 0.13), relative=True))
-            extra_layers.append(hook_clip)
-        except Exception as exc:
-            print(f"[editor] hook banner failed ({exc}); skipping")
-
-# Progress bar removed for maximum MoviePy encoding speed.
-
-    if len(extra_layers) > 1:
-        final = CompositeVideoClip(extra_layers, size=(_tw, _th))
+        # Concatenate + export. fps passed explicitly as int keyword:
+        # moviepy 1.0.3's use_clip_fps_by_default only picks up fps from
+        # kwargs (positional fps is ignored -> None -> writer crash).
+        final = concatenate_videoclips([seg1, seg2, seg3], method="compose")
         final.fps = int(fps)
 
-    # Encode at edit res, then upscale to 1080x1920 in one cheap pass.
-    edit_path = (os.path.splitext(output_path)[0] + "_edit.mp4"
-                 if _scale != 1.0 else output_path)
-    final.write_videofile(edit_path, codec="libx264", audio_codec="aac",
-                          fps=int(fps), preset="veryfast", threads=4,
-                          logger=None)
-    if edit_path != output_path:
-        # Output dims are even, so no odd-height chroma padding needed.
-        try:
-            # imageio only exports IMAGEIO_FFMPEG_EXE to child processes when
-            # moviepy itself spawned ffmpeg; a plain import leaves it unset, so
-            # an unguarded os.environ[...] raises KeyError here. Resolve the
-            # binary ourselves (also handles FFmpeg being off PATH).
-            ffmpeg_bin = os.environ.get("IMAGEIO_FFMPEG_EXE") or ""
-            if not ffmpeg_bin:
-                try:
-                    from audio_detector import _resolve_ffmpeg_bin
-                    ffmpeg_bin = _resolve_ffmpeg_bin("ffmpeg")
-                except Exception:
-                    ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
-            subprocess.run(
-                [ffmpeg_bin, "-y", "-i", edit_path,
-                 "-vf", f"scale={TARGET_W}:{TARGET_H}:flags=bicubic",
-                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                 "-pix_fmt", "yuv420p", "-c:a", "aac",
-                 "-movflags", "+faststart", output_path],
-                check=True, capture_output=True, text=True,
-            )
-        except Exception as exc:
-            # Never destroy the rendered edit: it is already a valid video,
-            # just at edit res. Keep it as the deliverable instead.
-            print(f"[video_editor] upscale failed ({exc}); "
-                  f"keeping edit-res render {edit_path}")
-            if not os.path.isfile(output_path):
-                shutil.move(edit_path, output_path)
-            return output_path
-        finally:
-            if os.path.isfile(edit_path):
-                os.remove(edit_path)
-    try:
-        src.reader.close()
-    except Exception:
-        pass
-    return output_path
+        import random
+
+        extra_layers = [final]
+
+        # 1. Attribution watermark (credit pill badge)
+        if credit_text and credit_text.strip():
+            try:
+                badge_img = create_credit_badge_image(credit_text.strip(), scale=_scale)
+                badge_clip = (ImageClip(np.array(badge_img))
+                              .set_duration(final.duration)
+                              .set_position(("center", 0.06), relative=True))
+                extra_layers.append(badge_clip)
+            except Exception as exc:
+                print(f"[editor] credit watermark failed ({exc}); continuing without badge")
+
+        # 2. Viral Hook Header Banner (Top retention hook)
+        if hook_text is None and HOOK_TEMPLATES:
+            hook_text = random.choice(HOOK_TEMPLATES)
+        if hook_text and hook_text.strip():
+            try:
+                hook_img = create_hook_banner_image(hook_text.strip(), scale=_scale)
+                banner_dur = min(3.0, max(2.0, (vo_dur + 0.3) if vo_dur > 0 else 2.5))
+                if final.duration:
+                    banner_dur = min(banner_dur, final.duration)
+                hook_clip = (ImageClip(np.array(hook_img))
+                             .set_duration(banner_dur)
+                             .set_position(("center", 0.13), relative=True))
+                extra_layers.append(hook_clip)
+            except Exception as exc:
+                print(f"[editor] hook banner failed ({exc}); skipping")
+
+    # Progress bar removed for maximum MoviePy encoding speed.
+
+        if len(extra_layers) > 1:
+            final = CompositeVideoClip(extra_layers, size=(_tw, _th))
+            final.fps = int(fps)
+        clips_to_close.append(final)
+
+        # Encode at edit res, then upscale to 1080x1920 in one cheap pass.
+        edit_path = (os.path.splitext(output_path)[0] + "_edit.mp4"
+                     if _scale != 1.0 else output_path)
+        temp_audio = os.path.splitext(edit_path)[0] + "_temp_audio.mp4"
+        final.write_videofile(edit_path, codec="libx264", audio_codec="aac",
+                              fps=int(fps), preset="veryfast", threads=4,
+                              temp_audiofile=temp_audio, remove_temp=False,
+                              logger=None)
+        if edit_path != output_path:
+            # Output dims are even, so no odd-height chroma padding needed.
+            try:
+                # imageio only exports IMAGEIO_FFMPEG_EXE to child processes when
+                # moviepy itself spawned ffmpeg; a plain import leaves it unset, so
+                # an unguarded os.environ[...] raises KeyError here. Resolve the
+                # binary ourselves (also handles FFmpeg being off PATH).
+                ffmpeg_bin = os.environ.get("IMAGEIO_FFMPEG_EXE") or ""
+                if not ffmpeg_bin:
+                    try:
+                        from audio_detector import _resolve_ffmpeg_bin
+                        ffmpeg_bin = _resolve_ffmpeg_bin("ffmpeg")
+                    except Exception:
+                        ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
+                subprocess.run(
+                    [ffmpeg_bin, "-y", "-nostdin", "-i", edit_path,
+                     "-vf", f"scale={TARGET_W}:{TARGET_H}:flags=bicubic",
+                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                     "-pix_fmt", "yuv420p", "-c:a", "aac",
+                     "-movflags", "+faststart", output_path],
+                    check=True, capture_output=True, text=True, timeout=300,
+                )
+            except Exception as exc:
+                # Never destroy the rendered edit: it is already a valid video,
+                # just at edit res. Keep it as the deliverable instead.
+                print(f"[video_editor] upscale failed ({exc}); "
+                      f"keeping edit-res render {edit_path}")
+                if not os.path.isfile(output_path):
+                    shutil.move(edit_path, output_path)
+                return output_path
+            finally:
+                if os.path.isfile(edit_path):
+                    _safe_remove(edit_path)
+        return output_path
+    finally:
+        for c in reversed(clips_to_close):
+            _safe_close_clip(c)
+        import gc
+        gc.collect()
+        if temp_audio:
+            _safe_remove(temp_audio)
 
 
 if __name__ == "__main__":
