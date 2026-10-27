@@ -184,6 +184,9 @@ def stage_acquire_batch(args, max_items: int):
     if not acquired:
         log.error("STAGE acquire FAILED: all %d candidates failed to download.",
                   len(hits))
+        log.error("HINT: YouTube blocks unauthenticated downloads on cloud datacenter IPs (GitHub Actions / Azure). "
+                  "To resolve, export your YouTube cookies and add them to GitHub Repository Secrets as 'YOUTUBE_COOKIES'. "
+                  "See: https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp")
         raise SystemExit(2)
     log.info("Acquired %d/%d requested video(s).", len(acquired), max_items)
     return acquired
