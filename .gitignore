@@ -22,3 +22,9 @@ _push.err.txt
 _push.out.txt
 _push_old.py
 _gitcheck.py
+
+.env.txt
+.agents/
+ORIGINAL_REQUEST.md
+TEST_INFRA.md
+TEST_READY.md

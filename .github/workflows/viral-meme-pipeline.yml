@@ -29,13 +29,10 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
 
-      - name: Install FFmpeg
-        run: |
-          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
-            winget install --id Gyan.FFmpeg -e --accept-source-agreements --accept-package-agreements --silent
-            $env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User')
-          }
-          ffmpeg -version | Select-Object -First 1
+      - name: Set up FFmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v3
+        with:
+          ffmpeg-version: release
 
       - name: Install dependencies
         run: |
@@ -53,8 +50,12 @@ jobs:
           if ($env:GOOGLE_OAUTH_CLIENT_SECRET) { $envOut += "GOOGLE_OAUTH_CLIENT_SECRET=$env:GOOGLE_OAUTH_CLIENT_SECRET" }
           if ($envOut.Count -gt 0) { Set-Content -Path .env -Value $envOut -Encoding UTF8 }
           if ($env:GOOGLE_OAUTH_TOKEN) {
-            $decoded = [Convert]::FromBase64String($env:GOOGLE_OAUTH_TOKEN)
-            [IO.File]::WriteAllBytes('google_oauth_token.json', $decoded)
+            try {
+              $decoded = [Convert]::FromBase64String($env:GOOGLE_OAUTH_TOKEN)
+              [IO.File]::WriteAllBytes('google_oauth_token.json', $decoded)
+            } catch {
+              Set-Content -Path 'google_oauth_token.json' -Value $env:GOOGLE_OAUTH_TOKEN -Encoding UTF8
+            }
           }
           if (Test-Path .env) {
             Get-Content .env
