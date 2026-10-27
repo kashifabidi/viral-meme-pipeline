@@ -10,6 +10,7 @@ env:
   GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
   GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
   GOOGLE_OAUTH_TOKEN: ${{ secrets.GOOGLE_OAUTH_TOKEN }}
+  YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
 
 jobs:
   produce-memes:
@@ -40,6 +41,7 @@ jobs:
           # Install CPU torch first so it does not pull the 2.5GB CUDA binary
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -r requirements.txt
+          python -m pip install --upgrade yt-dlp
 
       - name: Write credentials from GitHub Secrets
         run: |
@@ -56,6 +58,10 @@ jobs:
             } catch {
               Set-Content -Path 'google_oauth_token.json' -Value $env:GOOGLE_OAUTH_TOKEN -Encoding UTF8
             }
+          }
+          if ($env:YOUTUBE_COOKIES) {
+            Set-Content -Path 'cookies.txt' -Value $env:YOUTUBE_COOKIES -Encoding UTF8
+            Write-Host "Configured YouTube cookies from repository secret."
           }
           if (Test-Path .env) {
             Get-Content .env

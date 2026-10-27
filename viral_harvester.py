@@ -244,6 +244,7 @@ def get_youtube_hits(
     # returns duration + view_count on ytsearch results -- verified locally.
     # ignoreerrors=True stops one unavailable video from aborting the whole
     # result page.
+    cookie_file = _get_yt_cookiefile()
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -252,7 +253,14 @@ def get_youtube_hits(
         "extract_flat": True,
         "ignoreerrors": True,
         "socket_timeout": 20,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"]
+            }
+        }
     }
+    if cookie_file:
+        opts["cookiefile"] = cookie_file
 
     pool = []
     with YoutubeDL(opts) as ydl:
@@ -377,6 +385,26 @@ def download_candidate(hit: dict, output_folder: str = "downloads") -> str:
         f"all URLs failed for '{hit.get('title')}': {last_err}")
 
 
+def _get_yt_cookiefile(output_folder: str = "downloads") -> str | None:
+    """Find or materialize a YouTube cookies file if configured."""
+    cookie_file = os.environ.get("YOUTUBE_COOKIES_FILE", "cookies.txt")
+    if not os.path.isabs(cookie_file):
+        cookie_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), cookie_file)
+    if os.path.isfile(cookie_file):
+        return cookie_file
+    raw_cookies = os.environ.get("YOUTUBE_COOKIES", "").strip()
+    if raw_cookies:
+        os.makedirs(output_folder, exist_ok=True)
+        env_cookie_path = os.path.join(output_folder, ".yt_cookies.txt")
+        try:
+            with open(env_cookie_path, "w", encoding="utf-8") as cf:
+                cf.write(raw_cookies)
+            return env_cookie_path
+        except Exception:
+            pass
+    return None
+
+
 def _ffmpeg_location():
     """Absolute path to ffmpeg's directory, for yt-dlp's ffmpeg_location.
 
@@ -418,8 +446,9 @@ def download_source_video(url: str, output_folder: str = "downloads", hit_metada
               "sources needing audio/video merging may fail. Install with: "
               "winget install --id Gyan.FFmpeg -e")
     template = os.path.join(output_folder, "%(id)s.%(ext)s")
-    opts = {
-        "format": "bv*+ba/b",
+    cookie_file = _get_yt_cookiefile(output_folder)
+    base_opts = {
+        "format": "b/bv*+ba",
         "merge_output_format": "mp4",
         "outtmpl": template,
         "noplaylist": True,
@@ -427,9 +456,38 @@ def download_source_video(url: str, output_folder: str = "downloads", hit_metada
         "no_warnings": True,
     }
     if ffmpeg_dir:
-        opts["ffmpeg_location"] = ffmpeg_dir
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+        base_opts["ffmpeg_location"] = ffmpeg_dir
+    if cookie_file:
+        base_opts["cookiefile"] = cookie_file
+
+    client_configs = [
+        ["android", "web"],
+        ["android"],
+        ["mweb"],
+        ["ios"],
+        ["tv"],
+    ]
+
+    info = None
+    last_exc = None
+    for clients in client_configs:
+        opts = dict(base_opts)
+        opts["extractor_args"] = {"youtube": {"player_client": clients}}
+        try:
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if info:
+                    break
+        except Exception as exc:
+            last_exc = exc
+            continue
+
+    if not info:
+        try:
+            with YoutubeDL(base_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+        except Exception as exc:
+            raise last_exc or exc
         if not info:
             raise RuntimeError(f"yt-dlp returned no info for {url}")
         # For playlists/chapters take the first real entry.
