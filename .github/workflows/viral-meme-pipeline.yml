@@ -100,7 +100,7 @@ jobs:
           $log = 'actions.log'
           $start = Get-Date
           try {
-            python main.py --harvest --max 3 --keep-local | Tee-Object -FilePath $log
+            python main.py --harvest --max 3 --keep-local 2>&1 | Tee-Object -FilePath $log
           } catch {
             Write-Warning "Pipeline raised: $_"
           }
@@ -135,13 +135,16 @@ jobs:
         if: always()
         run: |
           if (Test-Path actions.log) {
-            $log = Get-Content actions.log
-            if ($log -match 'PIPELINE DONE') {
-              Write-Host '✅ Batch complete'
+            $logLines = Get-Content actions.log
+            $logRaw = Get-Content actions.log -Raw
+            if ($logRaw -match 'PIPELINE DONE' -and $logRaw -match '[1-9]\d* ok') {
+              Write-Host '✅ Batch complete: videos successfully generated & published.'
+            } elseif ($logRaw -match 'PIPELINE DONE') {
+              Write-Host '⚠️ Batch finished, but 0 videos produced.'
             } else {
-              Write-Host '❌ Batch failed — see actions.log'
+              Write-Host '❌ Batch failed to complete — see actions.log'
             }
-            $log | Select-Object -Last 15
+            $logLines | Select-Object -Last 25
           } else {
             Write-Host '⚠️ actions.log not found'
           }
