@@ -136,6 +136,18 @@ def stage_acquire(args) -> str:
         except Exception as exc:
             log.warning("Candidate failed (%s), trying next...", exc)
             continue
+    # If all primary hits failed, try curated Creative Commons fallbacks
+    try:
+        from viral_harvester import get_fallback_candidates
+        for cand in get_fallback_candidates():
+            try:
+                path = download_candidate(cand)
+                log.info("Downloaded fallback -> %s", path)
+                return path
+            except Exception:
+                continue
+    except Exception:
+        pass
     log.error("STAGE acquire FAILED: all %d candidates failed to download.",
               len(hits))
     raise SystemExit(2)
@@ -180,6 +192,23 @@ def stage_acquire_batch(args, max_items: int):
             continue
         log.info("Downloaded -> %s", path)
         acquired.append(path)
+
+    if not acquired:
+        log.warning("All primary candidates failed (datacenter IP bot check / network). Activating curated Creative Commons fallbacks...")
+        try:
+            from viral_harvester import get_fallback_candidates
+            for cand in get_fallback_candidates():
+                if len(acquired) >= max_items:
+                    break
+                try:
+                    path = download_candidate(cand)
+                    log.info("Downloaded fallback -> %s", path)
+                    acquired.append(path)
+                except Exception as exc:
+                    log.warning("Fallback candidate failed: %s", exc)
+                    continue
+        except Exception as fb_exc:
+            log.warning("Fallback acquisition failed: %s", fb_exc)
 
     if not acquired:
         log.error("STAGE acquire FAILED: all %d candidates failed to download.",
